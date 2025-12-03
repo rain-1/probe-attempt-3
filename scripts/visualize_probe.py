@@ -68,11 +68,13 @@ def generate_predictions(
     probes: Dict[int, nn.Module],
     token_ids: List[int],
     device: str,
+    task: str,
 ) -> Dict[int, List[float]]:
     """
     Generate predictions for each token position.
-    Colors align with the *predicted* next token, so probability at index j reflects
-    the probe's confidence that token j equals the target token.
+    Colors align with the predicted token for the configured task. For next-token probes,
+    probability at index j reflects the model's confidence that token j equals the target token.
+    For current-token probes, probability refers to the highlighted token itself.
     """
     input_ids = torch.tensor([token_ids], device=device)
     seq_len = input_ids.shape[1]
@@ -83,8 +85,14 @@ def generate_predictions(
         hidden_states = extract_hidden_states(model, input_ids, layer)  # (1, seq_len, hidden_dim)
         predictions = [None] * seq_len
 
-        # Hidden state at position i predicts token i+1, so shift assignment
-        for i in range(seq_len - 1):
+        if task == "next":
+            index_range = range(seq_len - 1)
+            offset = 1
+        else:
+            index_range = range(seq_len)
+            offset = 0
+
+        for i in index_range:
             hidden = hidden_states[0, i, :].unsqueeze(0).float()
 
             if torch.isnan(hidden).any():
@@ -96,7 +104,7 @@ def generate_predictions(
             if prob != prob:  # NaN
                 continue
 
-            predictions[i + 1] = prob
+            predictions[i + offset] = prob
 
         layer_predictions[layer] = predictions
 
@@ -109,6 +117,7 @@ def create_html_visualization(
     layer_predictions: Dict[int, List[float]],
     metadata: dict,
     output_path: str,
+    task: str,
 ):
     """Create interactive HTML visualization."""
 
@@ -246,7 +255,7 @@ def create_html_visualization(
     <div class="metadata">
         <p><strong>Model:</strong> {metadata.get('model_name', 'N/A')}</p>
         <p><strong>Target Token:</strong> "{metadata.get('target_token', 'N/A')}"</p>
-        <p><strong>Task:</strong> {"Current token" if metadata.get('task') == 'current' else "Next token"} prediction</p>
+        <p><strong>Task:</strong> {"Current token" if task == 'current' else "Next token"} prediction</p>
         <p><strong>Layers:</strong> {min(layers)} - {max(layers)}</p>
     </div>
 
@@ -270,7 +279,7 @@ def create_html_visualization(
             <span>1.0 (Definitely YES)</span>
         </div>
         <p style="font-size:14px;color:#666;margin-top:10px;">
-            Colors indicate the probe's belief that the highlighted token itself equals the target token ("{metadata.get('target_token', 'N/A').strip()}" for next-token probes).
+            Colors indicate the probe's belief that the highlighted {"token itself equals" if task == 'current' else "token is followed by"} the target token ("{metadata.get('target_token', 'N/A').strip()}").
         </p>
     </div>
 
@@ -400,6 +409,7 @@ def main():
     # Load probes
     probes = {}
     metadata = None
+    tasks = set()
 
     for probe_file in probe_files:
         probe, meta = load_probe(str(probe_file), args.device)
@@ -409,7 +419,17 @@ def main():
         if metadata is None:
             metadata = meta
 
+        tasks.add(meta.get("task", "next"))
+
         print(f"Loaded probe for layer {layer}")
+
+    if metadata is None:
+        raise ValueError("No probe metadata found")
+
+    if len(tasks) > 1:
+        raise ValueError(f"Mixed probe tasks detected: {tasks}. Please visualize one task at a time.")
+
+    dataset_task = tasks.pop() if tasks else metadata.get("task", "next")
 
     # Determine model name
     model_name = args.model_name or metadata["model_name"]
@@ -467,6 +487,7 @@ def main():
         probes,
         token_ids,
         args.device,
+        dataset_task,
     )
 
     # Create visualization
@@ -476,6 +497,7 @@ def main():
         layer_predictions,
         metadata,
         args.output,
+        dataset_task,
     )
 
     print(f"\nDone! Open {args.output} in a web browser to view the visualization.")

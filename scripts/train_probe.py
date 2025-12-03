@@ -437,6 +437,8 @@ def main():
                         help="Comma-separated layer indices or 'auto' for automatic sweep")
     parser.add_argument("--predict_current", action="store_true",
                         help="Predict current token instead of next token")
+    parser.add_argument("--task", type=str, choices=["next", "current"], default=None,
+                        help="Override dataset task (next/current). Defaults to dataset metadata")
     parser.add_argument("--batch_size", type=int, default=48)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--steps_per_epoch", type=int, default=None,
@@ -490,6 +492,24 @@ def main():
     print(f"Loading validation data from {args.val_data}...")
     val_data = torch.load(args.val_data, weights_only=False)
 
+    train_task = train_data.get("metadata", {}).get("task")
+    val_task = val_data.get("metadata", {}).get("task") or train_task
+
+    if val_task and train_task and val_task != train_task:
+        raise ValueError(f"Train task '{train_task}' and val task '{val_task}' do not match")
+
+    inferred_task = train_task or ("current" if args.predict_current else "next")
+
+    if args.task:
+        if inferred_task and args.task != inferred_task:
+            print(f"Warning: overriding dataset task '{inferred_task}' with CLI task '{args.task}'")
+        inferred_task = args.task
+    elif args.predict_current:
+        inferred_task = "current"
+
+    args.predict_current = (inferred_task == "current")
+    task_label = inferred_task
+
     # Initialize wandb group for sweeps
     if not args.no_wandb and WANDB_AVAILABLE and len(layers) > 1:
         if not args.wandb_group:
@@ -520,6 +540,7 @@ def main():
                     "epochs": args.epochs,
                     "learning_rate": args.learning_rate,
                     "predict_current": args.predict_current,
+                    "task": task_label,
                     "context_length": train_data['metadata']['context_length'],
                     "target_token": train_data['metadata']['target_token'],
                 },

@@ -6,3 +6,4 @@ wandb/
 .cache/
 data/
 visualizations/
+data_model_current/

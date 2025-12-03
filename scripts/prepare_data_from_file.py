@@ -28,6 +28,7 @@ def extract_chunks_from_text(
     tokenizer,
     target_token_id: int,
     context_length: int,
+    task: str = "next",
     max_chunks: int = None,
 ) -> Tuple[List[List[int]], List[int]]:
     """
@@ -47,14 +48,17 @@ def extract_chunks_from_text(
     for i in tqdm(range(0, len(token_ids) - context_length, stride), desc="Processing"):
         chunk = token_ids[i:i + context_length]
 
-        # Check if there's a next token
-        if i + context_length < len(token_ids):
-            next_token = token_ids[i + context_length]
+        if task == "next":
+            if i + context_length >= len(token_ids):
+                break
+            target_token = token_ids[i + context_length]
+        else:  # current token classification
+            target_token = chunk[-1]
 
-            if next_token == target_token_id:
-                positive_chunks.append(chunk)
-            else:
-                negative_chunks.append(chunk)
+        if target_token == target_token_id:
+            positive_chunks.append(chunk)
+        else:
+            negative_chunks.append(chunk)
 
         # Early exit if we have enough chunks
         if max_chunks and len(positive_chunks) > max_chunks and len(negative_chunks) > max_chunks:
@@ -132,6 +136,8 @@ def main():
                         help="Target token to predict")
     parser.add_argument("--context_length", type=int, default=256,
                         help="Length of context window")
+    parser.add_argument("--task", type=str, choices=["next", "current"], default="next",
+                        help="Whether to label based on next token (default) or current token")
     parser.add_argument("--max_chunks_per_class", type=int, default=50000,
                         help="Maximum chunks to extract per class before balancing")
     parser.add_argument("--train_ratio", type=float, default=0.8,
@@ -166,6 +172,7 @@ def main():
         tokenizer,
         target_token_id,
         args.context_length,
+        task=args.task,
         max_chunks=args.max_chunks_per_class,
     )
 
@@ -186,6 +193,7 @@ def main():
         "seed": args.seed,
         "label_source": "model_generated",  # Ground truth = model predictions
         "source_file": args.input_file,
+        "task": args.task,
     }
 
     # Save datasets
