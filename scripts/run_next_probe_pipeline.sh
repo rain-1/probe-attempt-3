@@ -59,17 +59,17 @@ else
   echo "    HF_DATASET_ID not set; skipping upload."
 fi
 
-echo "[3/4] Training layer-0 next-token probe"
+echo "[3/4] Training layer-17 next-token probe"
 python scripts/train_probe.py \
   --train_data "$TRAIN_PATH" \
   --val_data "$VAL_PATH" \
-  --layer 0 \
+  --layer 17 \
   --task next \
   --batch_size "$BATCH_SIZE" \
   --epochs "$EPOCHS" \
   --no_wandb
 
-MODEL_PATH="models/probe_layer0_next.pth"
+MODEL_PATH="models/probe_layer17_next.pth"
 if [[ -f "$MODEL_PATH" ]]; then
   echo "    Probe saved to $MODEL_PATH"
 fi
