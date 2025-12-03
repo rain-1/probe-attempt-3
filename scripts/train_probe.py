@@ -133,6 +133,58 @@ def compute_metrics(predictions: np.ndarray, labels: np.ndarray) -> Dict[str, fl
     }
 
 
+def run_validation(
+    probe: nn.Module,
+    model,
+    val_loader: DataLoader,
+    layer: int,
+    device: str,
+    pos_weight_tensor: torch.Tensor,
+    predict_current: bool,
+    desc: str = "Validation",
+) -> Tuple[float, Dict[str, float]]:
+    """Run validation and return loss and metrics."""
+    probe.eval()
+    val_loss = 0.0
+    val_preds = []
+    val_true = []
+
+    with torch.no_grad():
+        for batch_input_ids, batch_labels in tqdm(val_loader, desc=desc, leave=False):
+            batch_input_ids = batch_input_ids.to(device)
+            batch_labels = batch_labels.to(device)
+
+            hidden = extract_hidden_states(
+                model,
+                batch_input_ids,
+                layer,
+                device,
+                predict_current=predict_current,
+            )
+
+            # Skip bad batches
+            if torch.isnan(hidden).any() or torch.isinf(hidden).any():
+                continue
+
+            hidden = hidden.float()
+            logits = probe(hidden).squeeze(-1)
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                batch_labels,
+                pos_weight=pos_weight_tensor,
+            )
+
+            val_loss += loss.item()
+            probs = torch.sigmoid(logits).cpu().numpy()
+            val_preds.extend(probs)
+            val_true.extend(batch_labels.cpu().numpy())
+
+    avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+    val_metrics = compute_metrics(np.array(val_preds), np.array(val_true))
+
+    return avg_val_loss, val_metrics
+
+
 def train_probe(
     model,
     tokenizer,
@@ -162,6 +214,12 @@ def train_probe(
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
 
+    # Create quick validation loader (subset)
+    quick_val_size = max(1, int(len(val_dataset) * args.quick_val_fraction))
+    quick_val_indices = list(range(quick_val_size))
+    quick_val_subset = torch.utils.data.Subset(val_dataset, quick_val_indices)
+    quick_val_loader = DataLoader(quick_val_subset, batch_size=args.batch_size, shuffle=False)
+
     # Calculate pos_weight for loss function
     n_pos = train_labels.sum().item()
     n_neg = len(train_labels) - n_pos
@@ -178,15 +236,22 @@ def train_probe(
     # Training loop
     best_balanced_acc = 0.0
     best_metrics = None
+    global_step = 0
+    epoch_step = 0
 
     for epoch in range(args.epochs):
         probe.train()
-        train_loss = 0.0
-        train_preds = []
-        train_true = []
+        epoch_train_loss = 0.0
+        epoch_train_preds = []
+        epoch_train_true = []
+        epoch_step = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
         for batch_input_ids, batch_labels in pbar:
+            # Check if we've hit steps_per_epoch limit
+            if args.steps_per_epoch and epoch_step >= args.steps_per_epoch:
+                break
+
             batch_input_ids = batch_input_ids.to(device)
             batch_labels = batch_labels.to(device)
 
@@ -220,80 +285,124 @@ def train_probe(
             loss.backward()
             optimizer.step()
 
-            # Track metrics
-            train_loss += loss.item()
+            # Track metrics for epoch summary
+            epoch_train_loss += loss.item()
             probs = torch.sigmoid(logits).detach().cpu().numpy()
-            train_preds.extend(probs)
-            train_true.extend(batch_labels.cpu().numpy())
+            epoch_train_preds.extend(probs)
+            epoch_train_true.extend(batch_labels.cpu().numpy())
 
-            pbar.set_postfix({"loss": loss.item()})
+            # Compute batch metrics for this batch
+            batch_preds = (probs >= 0.5).astype(int)
+            batch_true = batch_labels.cpu().numpy()
+            batch_acc = (batch_preds == batch_true).mean()
 
-        # Validation
-        probe.eval()
-        val_loss = 0.0
-        val_preds = []
-        val_true = []
+            # Format with fixed width to prevent jumping
+            pbar.set_postfix({"loss": f"{loss.item():.4f}", "acc": f"{batch_acc:.4f}"})
 
-        with torch.no_grad():
-            for batch_input_ids, batch_labels in tqdm(val_loader, desc="Validation"):
-                batch_input_ids = batch_input_ids.to(device)
-                batch_labels = batch_labels.to(device)
+            # Log to wandb every step
+            if wandb_run:
+                # Get current learning rate
+                current_lr = optimizer.param_groups[0]['lr']
 
-                hidden = extract_hidden_states(
+                wandb_run.log({
+                    "train/step_loss": loss.item(),
+                    "train/step_accuracy": batch_acc,
+                    "train/learning_rate": current_lr,
+                    "global_step": global_step,
+                })
+
+            global_step += 1
+            epoch_step += 1
+
+            # Quick validation every N steps
+            if args.val_every_n_steps and global_step % args.val_every_n_steps == 0:
+                # Compute training metrics on accumulated data so far this epoch
+                if len(epoch_train_preds) > 0:
+                    quick_train_metrics = compute_metrics(
+                        np.array(epoch_train_preds),
+                        np.array(epoch_train_true)
+                    )
+                    quick_train_loss = epoch_train_loss / epoch_step
+                else:
+                    quick_train_metrics = None
+                    quick_train_loss = 0.0
+
+                quick_val_loss, quick_val_metrics = run_validation(
+                    probe,
                     model,
-                    batch_input_ids,
+                    quick_val_loader,
                     layer,
                     device,
-                    predict_current=args.predict_current,
+                    pos_weight_tensor,
+                    args.predict_current,
+                    desc="Quick Val",
                 )
 
-                # Skip bad batches
-                if torch.isnan(hidden).any() or torch.isinf(hidden).any():
-                    continue
+                # Log quick validation and training metrics
+                if wandb_run:
+                    log_dict = {
+                        "quick_val/loss": quick_val_loss,
+                        "quick_val/balanced_accuracy": quick_val_metrics['balanced_accuracy'],
+                        "quick_val/pos_accuracy": quick_val_metrics['pos_accuracy'],
+                        "quick_val/neg_accuracy": quick_val_metrics['neg_accuracy'],
+                        "global_step": global_step,
+                    }
 
-                hidden = hidden.float()
-                logits = probe(hidden).squeeze(-1)
-                loss = F.binary_cross_entropy_with_logits(
-                    logits,
-                    batch_labels,
-                    pos_weight=pos_weight_tensor,
-                )
+                    # Add training metrics if available
+                    if quick_train_metrics:
+                        log_dict.update({
+                            "quick_train/loss": quick_train_loss,
+                            "quick_train/balanced_accuracy": quick_train_metrics['balanced_accuracy'],
+                            "quick_train/pos_accuracy": quick_train_metrics['pos_accuracy'],
+                            "quick_train/neg_accuracy": quick_train_metrics['neg_accuracy'],
+                        })
 
-                val_loss += loss.item()
-                probs = torch.sigmoid(logits).cpu().numpy()
-                val_preds.extend(probs)
-                val_true.extend(batch_labels.cpu().numpy())
+                    wandb_run.log(log_dict)
 
-        # Compute metrics
-        train_metrics = compute_metrics(np.array(train_preds), np.array(train_true))
-        val_metrics = compute_metrics(np.array(val_preds), np.array(val_true))
+                print(f"\n[Step {global_step}] Quick Val - Loss: {quick_val_loss:.4f}, Bal Acc: {quick_val_metrics['balanced_accuracy']:.4f}")
 
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
+                probe.train()  # Back to training mode
+
+        # End-of-epoch full validation
+        avg_val_loss, val_metrics = run_validation(
+            probe,
+            model,
+            val_loader,
+            layer,
+            device,
+            pos_weight_tensor,
+            args.predict_current,
+            desc="Full Validation",
+        )
+
+        # Compute training metrics
+        train_metrics = compute_metrics(np.array(epoch_train_preds), np.array(epoch_train_true))
+        avg_train_loss = epoch_train_loss / max(epoch_step, 1)
 
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         print(f"  Train Loss: {avg_train_loss:.4f}, Balanced Acc: {train_metrics['balanced_accuracy']:.4f}")
         print(f"  Val Loss: {avg_val_loss:.4f}, Balanced Acc: {val_metrics['balanced_accuracy']:.4f}")
         print(f"  Val Pos Acc: {val_metrics['pos_accuracy']:.4f}, Neg Acc: {val_metrics['neg_accuracy']:.4f}")
 
-        # Log to wandb
+        # Log to wandb (end of epoch - full validation)
         if wandb_run:
             wandb_run.log({
                 "epoch": epoch,
-                "train/loss": avg_train_loss,
-                "train/balanced_accuracy": train_metrics['balanced_accuracy'],
-                "train/accuracy": train_metrics['accuracy'],
-                "train/pos_accuracy": train_metrics['pos_accuracy'],
-                "train/neg_accuracy": train_metrics['neg_accuracy'],
-                "val/loss": avg_val_loss,
-                "val/balanced_accuracy": val_metrics['balanced_accuracy'],
-                "val/accuracy": val_metrics['accuracy'],
-                "val/pos_accuracy": val_metrics['pos_accuracy'],
-                "val/neg_accuracy": val_metrics['neg_accuracy'],
-                "val/tp": val_metrics['tp'],
-                "val/fp": val_metrics['fp'],
-                "val/tn": val_metrics['tn'],
-                "val/fn": val_metrics['fn'],
+                "epoch_train/loss": avg_train_loss,
+                "epoch_train/balanced_accuracy": train_metrics['balanced_accuracy'],
+                "epoch_train/accuracy": train_metrics['accuracy'],
+                "epoch_train/pos_accuracy": train_metrics['pos_accuracy'],
+                "epoch_train/neg_accuracy": train_metrics['neg_accuracy'],
+                "epoch_val/loss": avg_val_loss,
+                "epoch_val/balanced_accuracy": val_metrics['balanced_accuracy'],
+                "epoch_val/accuracy": val_metrics['accuracy'],
+                "epoch_val/pos_accuracy": val_metrics['pos_accuracy'],
+                "epoch_val/neg_accuracy": val_metrics['neg_accuracy'],
+                "epoch_val/tp": val_metrics['tp'],
+                "epoch_val/fp": val_metrics['fp'],
+                "epoch_val/tn": val_metrics['tn'],
+                "epoch_val/fn": val_metrics['fn'],
+                "global_step": global_step,
             })
 
         # Track best model
@@ -330,6 +439,12 @@ def main():
                         help="Predict current token instead of next token")
     parser.add_argument("--batch_size", type=int, default=48)
     parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--steps_per_epoch", type=int, default=None,
+                        help="Limit steps per epoch (None = full epoch)")
+    parser.add_argument("--val_every_n_steps", type=int, default=None,
+                        help="Run validation every N steps (None = once per epoch)")
+    parser.add_argument("--quick_val_fraction", type=float, default=0.1,
+                        help="Fraction of val set to use for quick validation (default: 0.1)")
     parser.add_argument("--learning_rate", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--pos_weight_cap", type=float, default=5.0)

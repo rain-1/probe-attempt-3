@@ -9,10 +9,11 @@ This project trains interpretability probes on the [gemma-3-270m](https://huggin
 **Key Features:**
 - Balanced dataset preparation with 50/50 positive/negative samples
 - Layer sweep support to test probes at different depths
-- WandB integration for experiment tracking
+- WandB integration with per-step logging for detailed training curves
 - Interactive HTML visualization of predictions
 - Numerical stability improvements (bfloat16, NaN handling)
 - Embedded metadata in probe files for reproducibility
+- Real-time training metrics (loss and accuracy per batch)
 
 ## Quick Start
 
