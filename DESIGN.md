@@ -5,6 +5,8 @@ The overall goal here is that we're trying to make a test project to train some 
 model unsloth/gemma-3-270m (bfloat16 is good, float16 is bad causes nan, float32 is ok but larger obviously)
 dataset https://huggingface.co/datasets/manu/project_gutenberg
 
+also let's use uv!
+
 # data
 
 For data we can just use Project Gutenberg books right so we've got text We'll run the text to the LLM and try to predict the word 'the' , so looking for the token ' the'.

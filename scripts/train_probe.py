@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+Probe training script with layer sweep support and WandB logging.
+Trains linear probes to predict next token from hidden states.
+"""
+
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+from typing import Optional, Tuple, Dict
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available, logging disabled")
+
+
+class LinearProbe(nn.Module):
+    """Simple linear probe for binary classification."""
+
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, 1)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+def get_model_dtype(dtype_str: str) -> torch.dtype:
+    """Convert dtype string to torch dtype."""
+    if dtype_str == "auto":
+        # Use bfloat16 if available (CUDA), else float32
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float32
+    elif dtype_str == "bfloat16":
+        return torch.bfloat16
+    elif dtype_str == "float16":
+        return torch.float16
+    elif dtype_str == "float32":
+        return torch.float32
+    else:
+        raise ValueError(f"Unknown dtype: {dtype_str}")
+
+
+def load_model_and_tokenizer(model_name: str, dtype: torch.dtype, device: str):
+    """Load model and tokenizer."""
+    print(f"Loading model {model_name} with dtype {dtype}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        device_map=device,
+    )
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    print(f"Model loaded on {device}")
+    print(f"Number of layers: {model.config.num_hidden_layers}")
+    print(f"Hidden size: {model.config.hidden_size}")
+
+    return model, tokenizer
+
+
+def extract_hidden_states(
+    model,
+    input_ids: torch.Tensor,
+    layer: int,
+    device: str,
+    predict_current: bool = False,
+) -> torch.Tensor:
+    """
+    Extract hidden states from a specific layer.
+    Returns hidden states for the final token (or second-to-last if predict_current=True).
+    """
+    with torch.no_grad():
+        outputs = model(input_ids, output_hidden_states=True)
+        hidden_states = outputs.hidden_states[layer]  # (batch, seq_len, hidden_dim)
+
+        if predict_current:
+            # For current token prediction, use the last token's hidden state
+            final_hidden = hidden_states[:, -1, :]
+        else:
+            # For next token prediction, use the last token's hidden state
+            # (which predicts the next token)
+            final_hidden = hidden_states[:, -1, :]
+
+    return final_hidden
+
+
+def compute_metrics(predictions: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
+    """Compute confusion matrix metrics."""
+    preds_binary = (predictions >= 0.5).astype(int)
+
+    tp = np.sum((preds_binary == 1) & (labels == 1))
+    fp = np.sum((preds_binary == 1) & (labels == 0))
+    tn = np.sum((preds_binary == 0) & (labels == 0))
+    fn = np.sum((preds_binary == 0) & (labels == 1))
+
+    accuracy = (tp + tn) / len(labels) if len(labels) > 0 else 0
+    pos_accuracy = tp / (tp + fn) if (tp + fn) > 0 else 0
+    neg_accuracy = tn / (tn + fp) if (tn + fp) > 0 else 0
+    balanced_accuracy = (pos_accuracy + neg_accuracy) / 2
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = pos_accuracy
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    return {
+        "accuracy": accuracy,
+        "balanced_accuracy": balanced_accuracy,
+        "pos_accuracy": pos_accuracy,
+        "neg_accuracy": neg_accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "tp": int(tp),
+        "fp": int(fp),
+        "tn": int(tn),
+        "fn": int(fn),
+    }
+
+
+def train_probe(
+    model,
+    tokenizer,
+    train_data: dict,
+    val_data: dict,
+    layer: int,
+    args,
+    wandb_run=None,
+) -> Tuple[LinearProbe, Dict[str, float]]:
+    """Train a probe for a specific layer."""
+
+    device = args.device
+    hidden_size = model.config.hidden_size
+
+    # Create probe (always in float32 for stability)
+    probe = LinearProbe(hidden_size).to(device).float()
+
+    # Prepare data
+    train_chunks = torch.tensor(train_data["chunks"], dtype=torch.long)
+    train_labels = torch.tensor(train_data["labels"], dtype=torch.float32)
+    val_chunks = torch.tensor(val_data["chunks"], dtype=torch.long)
+    val_labels = torch.tensor(val_data["labels"], dtype=torch.float32)
+
+    train_dataset = TensorDataset(train_chunks, train_labels)
+    val_dataset = TensorDataset(val_chunks, val_labels)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+
+    # Calculate pos_weight for loss function
+    n_pos = train_labels.sum().item()
+    n_neg = len(train_labels) - n_pos
+    pos_weight_raw = n_neg / n_pos if n_pos > 0 else 1.0
+    # Apply sqrt and cap to avoid extreme reweighting
+    pos_weight = min(math.sqrt(pos_weight_raw), args.pos_weight_cap)
+    pos_weight_tensor = torch.tensor([pos_weight], device=device)
+
+    print(f"Pos weight: {pos_weight:.3f} (raw: {pos_weight_raw:.3f}, capped at {args.pos_weight_cap})")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(probe.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+    # Training loop
+    best_balanced_acc = 0.0
+    best_metrics = None
+
+    for epoch in range(args.epochs):
+        probe.train()
+        train_loss = 0.0
+        train_preds = []
+        train_true = []
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs}")
+        for batch_input_ids, batch_labels in pbar:
+            batch_input_ids = batch_input_ids.to(device)
+            batch_labels = batch_labels.to(device)
+
+            # Extract hidden states
+            hidden = extract_hidden_states(
+                model,
+                batch_input_ids,
+                layer,
+                device,
+                predict_current=args.predict_current,
+            )
+
+            # Check for NaN/Inf and skip bad batches
+            if torch.isnan(hidden).any() or torch.isinf(hidden).any():
+                print(f"Warning: NaN/Inf detected in hidden states, skipping batch")
+                continue
+
+            # Cast to float32 for probe
+            hidden = hidden.float()
+
+            # Forward pass
+            logits = probe(hidden).squeeze(-1)
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                batch_labels,
+                pos_weight=pos_weight_tensor,
+            )
+
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Track metrics
+            train_loss += loss.item()
+            probs = torch.sigmoid(logits).detach().cpu().numpy()
+            train_preds.extend(probs)
+            train_true.extend(batch_labels.cpu().numpy())
+
+            pbar.set_postfix({"loss": loss.item()})
+
+        # Validation
+        probe.eval()
+        val_loss = 0.0
+        val_preds = []
+        val_true = []
+
+        with torch.no_grad():
+            for batch_input_ids, batch_labels in tqdm(val_loader, desc="Validation"):
+                batch_input_ids = batch_input_ids.to(device)
+                batch_labels = batch_labels.to(device)
+
+                hidden = extract_hidden_states(
+                    model,
+                    batch_input_ids,
+                    layer,
+                    device,
+                    predict_current=args.predict_current,
+                )
+
+                # Skip bad batches
+                if torch.isnan(hidden).any() or torch.isinf(hidden).any():
+                    continue
+
+                hidden = hidden.float()
+                logits = probe(hidden).squeeze(-1)
+                loss = F.binary_cross_entropy_with_logits(
+                    logits,
+                    batch_labels,
+                    pos_weight=pos_weight_tensor,
+                )
+
+                val_loss += loss.item()
+                probs = torch.sigmoid(logits).cpu().numpy()
+                val_preds.extend(probs)
+                val_true.extend(batch_labels.cpu().numpy())
+
+        # Compute metrics
+        train_metrics = compute_metrics(np.array(train_preds), np.array(train_true))
+        val_metrics = compute_metrics(np.array(val_preds), np.array(val_true))
+
+        avg_train_loss = train_loss / len(train_loader)
+        avg_val_loss = val_loss / len(val_loader)
+
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        print(f"  Train Loss: {avg_train_loss:.4f}, Balanced Acc: {train_metrics['balanced_accuracy']:.4f}")
+        print(f"  Val Loss: {avg_val_loss:.4f}, Balanced Acc: {val_metrics['balanced_accuracy']:.4f}")
+        print(f"  Val Pos Acc: {val_metrics['pos_accuracy']:.4f}, Neg Acc: {val_metrics['neg_accuracy']:.4f}")
+
+        # Log to wandb
+        if wandb_run:
+            wandb_run.log({
+                "epoch": epoch,
+                "train/loss": avg_train_loss,
+                "train/balanced_accuracy": train_metrics['balanced_accuracy'],
+                "train/accuracy": train_metrics['accuracy'],
+                "train/pos_accuracy": train_metrics['pos_accuracy'],
+                "train/neg_accuracy": train_metrics['neg_accuracy'],
+                "val/loss": avg_val_loss,
+                "val/balanced_accuracy": val_metrics['balanced_accuracy'],
+                "val/accuracy": val_metrics['accuracy'],
+                "val/pos_accuracy": val_metrics['pos_accuracy'],
+                "val/neg_accuracy": val_metrics['neg_accuracy'],
+                "val/tp": val_metrics['tp'],
+                "val/fp": val_metrics['fp'],
+                "val/tn": val_metrics['tn'],
+                "val/fn": val_metrics['fn'],
+            })
+
+        # Track best model
+        if val_metrics['balanced_accuracy'] > best_balanced_acc:
+            best_balanced_acc = val_metrics['balanced_accuracy']
+            best_metrics = val_metrics
+
+    return probe, best_metrics
+
+
+def save_probe(probe: LinearProbe, metadata: dict, output_path: str):
+    """Save probe with embedded metadata."""
+    save_dict = {
+        "state_dict": probe.state_dict(),
+        "metadata": metadata,
+    }
+    torch.save(save_dict, output_path)
+    print(f"Saved probe to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train probe on hidden states")
+    parser.add_argument("--model_name", type=str, default="unsloth/gemma-3-270m")
+    parser.add_argument("--model_dtype", type=str, default="auto",
+                        choices=["auto", "bfloat16", "float16", "float32"])
+    parser.add_argument("--train_data", type=str, default="data/train.pth")
+    parser.add_argument("--val_data", type=str, default="data/val.pth")
+    parser.add_argument("--output_dir", type=str, default="models")
+    parser.add_argument("--layer", type=int, default=None,
+                        help="Specific layer to train probe on")
+    parser.add_argument("--layer_sweep", type=str, default=None,
+                        help="Comma-separated layer indices or 'auto' for automatic sweep")
+    parser.add_argument("--predict_current", action="store_true",
+                        help="Predict current token instead of next token")
+    parser.add_argument("--batch_size", type=int, default=48)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--pos_weight_cap", type=float, default=5.0)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--wandb_project", type=str, default="probe-training")
+    parser.add_argument("--wandb_group", type=str, default=None)
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
+
+    args = parser.parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Load model once
+    dtype = get_model_dtype(args.model_dtype)
+    model, tokenizer = load_model_and_tokenizer(args.model_name, dtype, args.device)
+
+    num_layers = model.config.num_hidden_layers
+
+    # Determine layers to train on
+    if args.layer is not None:
+        layers = [args.layer]
+    elif args.layer_sweep == "auto":
+        # Auto sweep: first, last, and quartiles
+        layers = [
+            0,
+            num_layers // 4,
+            num_layers // 2,
+            3 * num_layers // 4,
+            num_layers - 1,
+        ]
+        layers = sorted(set(layers))  # Remove duplicates
+        print(f"Auto layer sweep: {layers}")
+    elif args.layer_sweep:
+        layers = [int(x.strip()) for x in args.layer_sweep.split(",")]
+    else:
+        # Default: last layer
+        layers = [num_layers - 1]
+
+    # Load data
+    print(f"Loading training data from {args.train_data}...")
+    train_data = torch.load(args.train_data)
+    print(f"Loading validation data from {args.val_data}...")
+    val_data = torch.load(args.val_data)
+
+    # Initialize wandb group for sweeps
+    if not args.no_wandb and WANDB_AVAILABLE and len(layers) > 1:
+        if not args.wandb_group:
+            task_type = "current" if args.predict_current else "next"
+            args.wandb_group = f"layer-sweep-{task_type}"
+
+    # Train probes for each layer
+    results = []
+    for layer_idx in layers:
+        print(f"\n{'='*80}")
+        print(f"Training probe for layer {layer_idx}/{num_layers-1}")
+        print(f"{'='*80}\n")
+
+        # Initialize wandb for this run
+        wandb_run = None
+        if not args.no_wandb and WANDB_AVAILABLE:
+            task_type = "current" if args.predict_current else "next"
+            run_name = f"probe-layer{layer_idx}-ctx{train_data['metadata']['context_length']}-{task_type}"
+
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                group=args.wandb_group,
+                name=run_name,
+                config={
+                    "model_name": args.model_name,
+                    "layer": layer_idx,
+                    "batch_size": args.batch_size,
+                    "epochs": args.epochs,
+                    "learning_rate": args.learning_rate,
+                    "predict_current": args.predict_current,
+                    "context_length": train_data['metadata']['context_length'],
+                    "target_token": train_data['metadata']['target_token'],
+                },
+                reinit=True,
+            )
+
+        # Train probe
+        probe, best_metrics = train_probe(
+            model,
+            tokenizer,
+            train_data,
+            val_data,
+            layer_idx,
+            args,
+            wandb_run,
+        )
+
+        # Save probe with metadata
+        task_suffix = "current" if args.predict_current else "next"
+        output_path = os.path.join(
+            args.output_dir,
+            f"probe_layer{layer_idx}_{task_suffix}.pth"
+        )
+
+        metadata = {
+            "layer": layer_idx,
+            "model_name": args.model_name,
+            "task": task_suffix,
+            "target_token": train_data['metadata']['target_token'],
+            "target_token_id": train_data['metadata']['target_token_id'],
+            "context_length": train_data['metadata']['context_length'],
+            "hidden_size": model.config.hidden_size,
+            "best_metrics": best_metrics,
+        }
+
+        save_probe(probe, metadata, output_path)
+
+        results.append({
+            "layer": layer_idx,
+            "balanced_accuracy": best_metrics['balanced_accuracy'],
+            "output_path": output_path,
+        })
+
+        if wandb_run:
+            wandb_run.finish()
+
+    # Print summary
+    print(f"\n{'='*80}")
+    print("TRAINING SUMMARY")
+    print(f"{'='*80}")
+    for result in results:
+        print(f"Layer {result['layer']}: Balanced Acc = {result['balanced_accuracy']:.4f}")
+        print(f"  Saved to: {result['output_path']}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""
+Data preparation script for probe training.
+Downloads Project Gutenberg dataset and creates balanced training/validation sets.
+"""
+
+import argparse
+import json
+import os
+import random
+from pathlib import Path
+from typing import List, Tuple
+
+import torch
+from datasets import load_dataset
+from tqdm import tqdm
+from transformers import AutoTokenizer
+
+
+def get_token_id(tokenizer, token_str: str) -> int:
+    """Get the token ID for a specific string."""
+    tokens = tokenizer.encode(token_str, add_special_tokens=False)
+    if len(tokens) != 1:
+        raise ValueError(f"Token '{token_str}' encodes to {len(tokens)} tokens, expected 1")
+    return tokens[0]
+
+
+def extract_chunks(
+    texts: List[str],
+    tokenizer,
+    target_token_id: int,
+    context_length: int,
+    max_chunks: int = None,
+) -> Tuple[List[List[int]], List[int]]:
+    """
+    Extract chunks from texts, classifying them by whether next token is the target.
+    Returns (chunks, labels) where labels are 1 if next token is target, 0 otherwise.
+    """
+    positive_chunks = []
+    negative_chunks = []
+
+    print(f"Extracting chunks from {len(texts)} texts...")
+
+    for text in tqdm(texts, desc="Processing texts"):
+        if not text or len(text.strip()) < 50:
+            continue
+
+        # Tokenize the entire text
+        token_ids = tokenizer.encode(text, add_special_tokens=False)
+
+        # Extract overlapping windows
+        stride = context_length // 2  # 50% overlap for more samples
+        for i in range(0, len(token_ids) - context_length, stride):
+            chunk = token_ids[i:i + context_length]
+
+            # Check if there's a next token
+            if i + context_length < len(token_ids):
+                next_token = token_ids[i + context_length]
+
+                if next_token == target_token_id:
+                    positive_chunks.append(chunk)
+                else:
+                    negative_chunks.append(chunk)
+
+            # Early exit if we have enough chunks
+            if max_chunks and len(positive_chunks) > max_chunks and len(negative_chunks) > max_chunks:
+                break
+
+        if max_chunks and len(positive_chunks) > max_chunks and len(negative_chunks) > max_chunks:
+            break
+
+    print(f"Found {len(positive_chunks)} positive chunks and {len(negative_chunks)} negative chunks")
+    return positive_chunks, negative_chunks
+
+
+def balance_and_split(
+    positive_chunks: List[List[int]],
+    negative_chunks: List[int],
+    train_ratio: float = 0.8,
+    seed: int = 42,
+) -> Tuple[List[List[int]], List[int], List[List[int]], List[int]]:
+    """
+    Balance positive/negative samples and split into train/val sets.
+    Returns (train_chunks, train_labels, val_chunks, val_labels)
+    """
+    random.seed(seed)
+
+    # Balance: take min of both classes
+    n_samples = min(len(positive_chunks), len(negative_chunks))
+    print(f"Balancing to {n_samples} samples per class...")
+
+    # Randomly sample to balance
+    positive_chunks = random.sample(positive_chunks, n_samples)
+    negative_chunks = random.sample(negative_chunks, n_samples)
+
+    # Create labels
+    positive_labels = [1] * len(positive_chunks)
+    negative_labels = [0] * len(negative_chunks)
+
+    # Combine and shuffle
+    all_chunks = positive_chunks + negative_chunks
+    all_labels = positive_labels + negative_labels
+
+    combined = list(zip(all_chunks, all_labels))
+    random.shuffle(combined)
+    all_chunks, all_labels = zip(*combined)
+    all_chunks = list(all_chunks)
+    all_labels = list(all_labels)
+
+    # Split train/val
+    split_idx = int(len(all_chunks) * train_ratio)
+    train_chunks = all_chunks[:split_idx]
+    train_labels = all_labels[:split_idx]
+    val_chunks = all_chunks[split_idx:]
+    val_labels = all_labels[split_idx:]
+
+    print(f"Train set: {len(train_chunks)} samples ({sum(train_labels)} positive)")
+    print(f"Val set: {len(val_chunks)} samples ({sum(val_labels)} positive)")
+
+    return train_chunks, train_labels, val_chunks, val_labels
+
+
+def save_dataset(chunks: List[List[int]], labels: List[int], output_path: str, metadata: dict):
+    """Save tokenized chunks and labels to disk."""
+    data = {
+        "chunks": chunks,
+        "labels": labels,
+        "metadata": metadata,
+    }
+    torch.save(data, output_path)
+    print(f"Saved {len(chunks)} samples to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Prepare balanced dataset for probe training")
+    parser.add_argument("--model_name", type=str, default="unsloth/gemma-3-270m",
+                        help="Model name for tokenizer")
+    parser.add_argument("--target_token", type=str, default=" the",
+                        help="Target token to predict")
+    parser.add_argument("--context_length", type=int, default=256,
+                        help="Length of context window")
+    parser.add_argument("--max_texts", type=int, default=1000,
+                        help="Maximum number of texts to process")
+    parser.add_argument("--max_chunks_per_class", type=int, default=50000,
+                        help="Maximum chunks to extract per class before balancing")
+    parser.add_argument("--train_ratio", type=float, default=0.8,
+                        help="Ratio of data to use for training")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed")
+    parser.add_argument("--output_dir", type=str, default="data",
+                        help="Output directory for processed data")
+    parser.add_argument("--language", type=str, default="en",
+                        help="Language split to use (en, fr, de, es, etc.)")
+
+    args = parser.parse_args()
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Load tokenizer
+    print(f"Loading tokenizer from {args.model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
+    # Get target token ID
+    target_token_id = get_token_id(tokenizer, args.target_token)
+    print(f"Target token '{args.target_token}' has ID: {target_token_id}")
+
+    # Load dataset
+    print(f"Loading Project Gutenberg dataset (language: {args.language})...")
+    dataset = load_dataset("manu/project_gutenberg", split=args.language, streaming=True)
+
+    # Take limited number of texts
+    texts = []
+    for i, item in enumerate(tqdm(dataset, total=args.max_texts, desc="Loading texts")):
+        if i >= args.max_texts:
+            break
+        if "text" in item and item["text"]:
+            texts.append(item["text"])
+
+    print(f"Loaded {len(texts)} texts")
+
+    # Extract chunks
+    positive_chunks, negative_chunks = extract_chunks(
+        texts,
+        tokenizer,
+        target_token_id,
+        args.context_length,
+        max_chunks=args.max_chunks_per_class,
+    )
+
+    # Balance and split
+    train_chunks, train_labels, val_chunks, val_labels = balance_and_split(
+        positive_chunks,
+        negative_chunks,
+        train_ratio=args.train_ratio,
+        seed=args.seed,
+    )
+
+    # Metadata
+    metadata = {
+        "model_name": args.model_name,
+        "target_token": args.target_token,
+        "target_token_id": target_token_id,
+        "context_length": args.context_length,
+        "seed": args.seed,
+    }
+
+    # Save datasets
+    train_path = os.path.join(args.output_dir, "train.pth")
+    val_path = os.path.join(args.output_dir, "val.pth")
+
+    save_dataset(train_chunks, train_labels, train_path, metadata)
+    save_dataset(val_chunks, val_labels, val_path, metadata)
+
+    # Save metadata separately for easy access
+    metadata_path = os.path.join(args.output_dir, "metadata.json")
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved metadata to {metadata_path}")
+
+    print("\nDataset preparation complete!")
+    print(f"Train samples: {len(train_chunks)}")
+    print(f"Val samples: {len(val_chunks)}")
+    print(f"Balance: {sum(train_labels)}/{len(train_labels)} positive in train")
+
+
+if __name__ == "__main__":
+    main()

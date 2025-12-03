@@ -4,3 +4,4 @@ wandb/
 *.txt
 *.pth
 .cache/
+data/
