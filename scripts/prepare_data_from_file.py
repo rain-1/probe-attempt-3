@@ -29,6 +29,7 @@ def extract_chunks_from_text(
     target_token_id: int,
     context_length: int,
     task: str = "next",
+    stride: int = None,
     max_chunks: int = None,
 ) -> Tuple[List[List[int]], List[int]]:
     """
@@ -42,8 +43,9 @@ def extract_chunks_from_text(
     token_ids = tokenizer.encode(text, add_special_tokens=False)
     print(f"Total tokens: {len(token_ids)}")
 
-    print(f"Extracting chunks...")
-    stride = context_length // 2  # 50% overlap
+    if stride is None or stride <= 0:
+        stride = context_length // 2
+    print(f"Extracting chunks with stride={stride}...")
 
     for i in tqdm(range(0, len(token_ids) - context_length, stride), desc="Processing"):
         chunk = token_ids[i:i + context_length]
@@ -136,6 +138,8 @@ def main():
                         help="Target token to predict")
     parser.add_argument("--context_length", type=int, default=256,
                         help="Length of context window")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Token stride between samples (default: half context for next-token, 1 for current-token)")
     parser.add_argument("--task", type=str, choices=["next", "current"], default="next",
                         help="Whether to label based on next token (default) or current token")
     parser.add_argument("--max_chunks_per_class", type=int, default=50000,
@@ -167,12 +171,16 @@ def main():
     print(f"Loaded text with {len(text)} characters")
 
     # Extract chunks
+    # Default stride: 1 for current-token so every position is eligible, else 50% overlap
+    stride = args.stride if args.stride is not None else (1 if args.task == "current" else args.context_length // 2)
+
     positive_chunks, negative_chunks = extract_chunks_from_text(
         text,
         tokenizer,
         target_token_id,
         args.context_length,
         task=args.task,
+        stride=stride,
         max_chunks=args.max_chunks_per_class,
     )
 
