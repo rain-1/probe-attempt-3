@@ -13,7 +13,8 @@ from transformers import AutoTokenizer
 def inspect_dataset(data_path: str, model_name: str, num_samples: int = 5):
     """Load and inspect a dataset."""
     print(f"Loading dataset from {data_path}...")
-    data = torch.load(data_path)
+    # Use weights_only=False since we trust our own data files
+    data = torch.load(data_path, weights_only=False)
 
     chunks = data["chunks"]
     labels = data["labels"]

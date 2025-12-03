@@ -486,9 +486,9 @@ def main():
 
     # Load data
     print(f"Loading training data from {args.train_data}...")
-    train_data = torch.load(args.train_data)
+    train_data = torch.load(args.train_data, weights_only=False)
     print(f"Loading validation data from {args.val_data}...")
-    val_data = torch.load(args.val_data)
+    val_data = torch.load(args.val_data, weights_only=False)
 
     # Initialize wandb group for sweeps
     if not args.no_wandb and WANDB_AVAILABLE and len(layers) > 1:

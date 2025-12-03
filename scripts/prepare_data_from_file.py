@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Data preparation script for probe training.
-Downloads Project Gutenberg dataset and creates balanced training/validation sets.
+Data preparation script that reads from a single text file.
+Useful for processing model-generated text where ground truth = model predictions.
 """
 
 import argparse
 import json
 import os
 import random
-from pathlib import Path
 from typing import List, Tuple
 
 import torch
-from datasets import load_dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 
 
 def get_token_id(tokenizer, token_str: str) -> int:
@@ -25,73 +23,40 @@ def get_token_id(tokenizer, token_str: str) -> int:
     return tokens[0]
 
 
-def extract_chunks(
-    texts: List[str],
+def extract_chunks_from_text(
+    text: str,
     tokenizer,
     target_token_id: int,
     context_length: int,
     max_chunks: int = None,
-    model=None,
-    device: str = "cuda",
 ) -> Tuple[List[List[int]], List[int]]:
     """
-    Extract chunks from texts, classifying them by whether next token is the target.
-
-    If model is None: labels based on ground truth (actual next token in text)
-    If model is provided: labels based on model's top-1 prediction (temp=0)
-
-    Returns (chunks, labels) where labels are 1 if next token is target, 0 otherwise.
+    Extract chunks from a single text file.
+    Returns (positive_chunks, negative_chunks).
     """
     positive_chunks = []
     negative_chunks = []
 
-    use_model_predictions = model is not None
+    print(f"Tokenizing text...")
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    print(f"Total tokens: {len(token_ids)}")
 
-    if use_model_predictions:
-        print(f"Extracting chunks from {len(texts)} texts using MODEL PREDICTIONS...")
-        model.eval()
-    else:
-        print(f"Extracting chunks from {len(texts)} texts using GROUND TRUTH...")
+    print(f"Extracting chunks...")
+    stride = context_length // 2  # 50% overlap
 
-    for text in tqdm(texts, desc="Processing texts"):
-        if not text or len(text.strip()) < 50:
-            continue
+    for i in tqdm(range(0, len(token_ids) - context_length, stride), desc="Processing"):
+        chunk = token_ids[i:i + context_length]
 
-        # Tokenize the entire text
-        token_ids = tokenizer.encode(text, add_special_tokens=False)
+        # Check if there's a next token
+        if i + context_length < len(token_ids):
+            next_token = token_ids[i + context_length]
 
-        # Extract overlapping windows
-        stride = context_length // 2  # 50% overlap for more samples
-        for i in range(0, len(token_ids) - context_length, stride):
-            chunk = token_ids[i:i + context_length]
+            if next_token == target_token_id:
+                positive_chunks.append(chunk)
+            else:
+                negative_chunks.append(chunk)
 
-            # Check if there's a next token
-            if i + context_length < len(token_ids):
-                if use_model_predictions:
-                    # Use model's prediction
-                    with torch.no_grad():
-                        input_ids = torch.tensor([chunk], device=device)
-                        outputs = model(input_ids)
-                        logits = outputs.logits[0, -1, :]  # Last token's logits
-                        predicted_token_id = torch.argmax(logits).item()
-
-                    if predicted_token_id == target_token_id:
-                        positive_chunks.append(chunk)
-                    else:
-                        negative_chunks.append(chunk)
-                else:
-                    # Use ground truth
-                    next_token = token_ids[i + context_length]
-
-                    if next_token == target_token_id:
-                        positive_chunks.append(chunk)
-                    else:
-                        negative_chunks.append(chunk)
-
-            # Early exit if we have enough chunks
-            if max_chunks and len(positive_chunks) > max_chunks and len(negative_chunks) > max_chunks:
-                break
-
+        # Early exit if we have enough chunks
         if max_chunks and len(positive_chunks) > max_chunks and len(negative_chunks) > max_chunks:
             break
 
@@ -158,32 +123,23 @@ def save_dataset(chunks: List[List[int]], labels: List[int], output_path: str, m
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Prepare balanced dataset for probe training")
+    parser = argparse.ArgumentParser(description="Prepare dataset from text file")
+    parser.add_argument("--input_file", type=str, required=True,
+                        help="Input text file to process")
     parser.add_argument("--model_name", type=str, default="unsloth/gemma-3-270m",
                         help="Model name for tokenizer")
     parser.add_argument("--target_token", type=str, default=" the",
                         help="Target token to predict")
     parser.add_argument("--context_length", type=int, default=256,
                         help="Length of context window")
-    parser.add_argument("--max_texts", type=int, default=1000,
-                        help="Maximum number of texts to process")
     parser.add_argument("--max_chunks_per_class", type=int, default=50000,
                         help="Maximum chunks to extract per class before balancing")
     parser.add_argument("--train_ratio", type=float, default=0.8,
                         help="Ratio of data to use for training")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
-    parser.add_argument("--output_dir", type=str, default="data",
+    parser.add_argument("--output_dir", type=str, default="data_model_pred",
                         help="Output directory for processed data")
-    parser.add_argument("--language", type=str, default="en",
-                        help="Language split to use (en, fr, de, es, etc.)")
-    parser.add_argument("--use_model_predictions", action="store_true",
-                        help="Use model predictions (temp=0) instead of ground truth for labels")
-    parser.add_argument("--model_dtype", type=str, default="auto",
-                        choices=["auto", "bfloat16", "float16", "float32"],
-                        help="Model dtype (only used with --use_model_predictions)")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Device to run model on (only used with --use_model_predictions)")
 
     args = parser.parse_args()
 
@@ -198,64 +154,19 @@ def main():
     target_token_id = get_token_id(tokenizer, args.target_token)
     print(f"Target token '{args.target_token}' has ID: {target_token_id}")
 
-    # Load model if using model predictions
-    model = None
-    if args.use_model_predictions:
-        print(f"\n{'='*60}")
-        print("USING MODEL PREDICTIONS FOR LABELS")
-        print(f"{'='*60}\n")
-        print(f"Loading model {args.model_name}...")
-
-        # Determine dtype
-        if args.model_dtype == "auto":
-            if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-                dtype = torch.bfloat16
-            else:
-                dtype = torch.float32
-        elif args.model_dtype == "bfloat16":
-            dtype = torch.bfloat16
-        elif args.model_dtype == "float16":
-            dtype = torch.float16
-        else:
-            dtype = torch.float32
-
-        print(f"Using dtype: {dtype}")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            torch_dtype=dtype,
-            device_map=args.device,
-        )
-        model.eval()
-        print("Model loaded successfully!")
-    else:
-        print(f"\n{'='*60}")
-        print("USING GROUND TRUTH FOR LABELS")
-        print(f"{'='*60}\n")
-
-    # Load dataset
-    print(f"Loading Project Gutenberg dataset (language: {args.language})...")
-    dataset = load_dataset("manu/project_gutenberg", split=args.language, streaming=True)
-
-    # Take limited number of texts
-    texts = []
-    for i, item in enumerate(tqdm(dataset, total=args.max_texts, desc="Loading texts")):
-        if i >= args.max_texts:
-            break
-        if "text" in item and item["text"]:
-            texts.append(item["text"])
-
-    print(f"Loaded {len(texts)} texts")
+    # Read text file
+    print(f"Reading text from {args.input_file}...")
+    with open(args.input_file, 'r') as f:
+        text = f.read()
+    print(f"Loaded text with {len(text)} characters")
 
     # Extract chunks
-    positive_chunks, negative_chunks = extract_chunks(
-        texts,
+    positive_chunks, negative_chunks = extract_chunks_from_text(
+        text,
         tokenizer,
         target_token_id,
         args.context_length,
         max_chunks=args.max_chunks_per_class,
-        model=model,
-        device=args.device,
     )
 
     # Balance and split
@@ -266,14 +177,15 @@ def main():
         seed=args.seed,
     )
 
-    # Metadata
+    # Metadata - mark as model_generated since this is model-generated text
     metadata = {
         "model_name": args.model_name,
         "target_token": args.target_token,
         "target_token_id": target_token_id,
         "context_length": args.context_length,
         "seed": args.seed,
-        "label_source": "model_predictions" if args.use_model_predictions else "ground_truth",
+        "label_source": "model_generated",  # Ground truth = model predictions
+        "source_file": args.input_file,
     }
 
     # Save datasets

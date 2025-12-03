@@ -1,0 +1,9 @@
+{
+  "model_name": "unsloth/gemma-3-270m",
+  "target_token": " the",
+  "target_token_id": 506,
+  "context_length": 256,
+  "seed": 42,
+  "label_source": "model_generated",
+  "source_file": "generated_text_1.txt"
+}

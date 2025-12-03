@@ -30,7 +30,8 @@ class LinearProbe(nn.Module):
 
 def load_probe(probe_path: str, device: str):
     """Load probe from file with metadata."""
-    data = torch.load(probe_path, map_location=device)
+    # Use weights_only=False since we trust our own probe files
+    data = torch.load(probe_path, map_location=device, weights_only=False)
     metadata = data["metadata"]
 
     probe = LinearProbe(metadata["hidden_size"]).to(device)
@@ -64,44 +65,38 @@ def extract_hidden_states(model, input_ids: torch.Tensor, layer: int):
 
 def generate_predictions(
     model,
-    tokenizer,
     probes: Dict[int, nn.Module],
-    text: str,
+    token_ids: List[int],
     device: str,
 ) -> Dict[int, List[float]]:
     """
-    Generate predictions for each token in the text using probes from different layers.
-    Returns dict mapping layer -> list of probabilities (one per token).
+    Generate predictions for each token position.
+    Colors align with the *predicted* next token, so probability at index j reflects
+    the probe's confidence that token j equals the target token.
     """
-    # Tokenize
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
     input_ids = torch.tensor([token_ids], device=device)
+    seq_len = input_ids.shape[1]
 
-    # Get predictions for each layer
     layer_predictions = {}
 
     for layer, probe in probes.items():
-        # Extract hidden states for this layer
         hidden_states = extract_hidden_states(model, input_ids, layer)  # (1, seq_len, hidden_dim)
+        predictions = [None] * seq_len
 
-        # Get prediction for each token
-        predictions = []
-        for i in range(hidden_states.shape[1]):
-            hidden = hidden_states[0, i, :].unsqueeze(0).float()  # (1, hidden_dim)
+        # Hidden state at position i predicts token i+1, so shift assignment
+        for i in range(seq_len - 1):
+            hidden = hidden_states[0, i, :].unsqueeze(0).float()
 
-            # Check for NaN
             if torch.isnan(hidden).any():
-                predictions.append(0.0)
                 continue
 
             logit = probe(hidden).squeeze(-1)
             prob = torch.sigmoid(logit).item()
 
-            # Convert NaN to 0 for JSON serialization
-            if prob != prob:  # NaN check
-                prob = 0.0
+            if prob != prob:  # NaN
+                continue
 
-            predictions.append(prob)
+            predictions[i + 1] = prob
 
         layer_predictions[layer] = predictions
 
@@ -274,6 +269,9 @@ def create_html_visualization(
             <span>0.5 (Uncertain)</span>
             <span>1.0 (Definitely YES)</span>
         </div>
+        <p style="font-size:14px;color:#666;margin-top:10px;">
+            Colors indicate the probe's belief that the highlighted token itself equals the target token ("{metadata.get('target_token', 'N/A').strip()}" for next-token probes).
+        </p>
     </div>
 
     <script>
@@ -376,11 +374,11 @@ def main():
     parser.add_argument("--model_dtype", type=str, default="auto")
     parser.add_argument("--num_tokens", type=int, default=4000,
                         help="Number of tokens to visualize")
-    parser.add_argument("--text_source", type=str, default="gutenberg",
+    parser.add_argument("--text_source", type=str, default="file",
                         choices=["gutenberg", "file"],
                         help="Source of text to visualize")
-    parser.add_argument("--text_file", type=str, default=None,
-                        help="Path to text file (if text_source=file)")
+    parser.add_argument("--text_file", type=str, default="generated_text.txt",
+                        help="Path to text file (used when text_source=file)")
     parser.add_argument("--language", type=str, default="en",
                         help="Language split to use for Gutenberg (en, fr, de, es, etc.)")
     parser.add_argument("--output", type=str, default="visualization.html",
@@ -429,9 +427,24 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Get text to visualize
-    if args.text_source == "file" and args.text_file:
-        print(f"Loading text from {args.text_file}...")
-        with open(args.text_file, 'r') as f:
+    if args.text_source == "file":
+        if not args.text_file:
+            raise ValueError("--text_file must be provided when --text_source=file")
+
+        text_path = Path(args.text_file)
+
+        if not text_path.exists():
+            pattern = f"{text_path.stem}*{text_path.suffix}"
+            candidates = sorted(text_path.parent.glob(pattern), key=lambda p: p.stat().st_mtime)
+
+            if candidates:
+                text_path = candidates[-1]
+                print(f"Default text file '{args.text_file}' not found. Using latest match: {text_path}")
+            else:
+                raise FileNotFoundError(f"Text file not found: {args.text_file}")
+
+        print(f"Loading text from {text_path}...")
+        with open(text_path, 'r') as f:
             text = f.read()
     else:
         print(f"Loading random text from Project Gutenberg (language: {args.language})...")
@@ -451,9 +464,8 @@ def main():
     # Generate predictions
     layer_predictions = generate_predictions(
         model,
-        tokenizer,
         probes,
-        text,
+        token_ids,
         args.device,
     )
 
