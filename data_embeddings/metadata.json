@@ -1,0 +1,9 @@
+{
+  "model_name": "unsloth/gemma-3-270m",
+  "target_token": " the",
+  "target_token_id": 506,
+  "embedding_dim": 640,
+  "seed": 42,
+  "data_type": "embeddings",
+  "source_file": "generated_text_0.txt"
+}
