@@ -1,0 +1,6 @@
+.env
+.venv/
+wandb/
+*.txt
+*.pth
+.cache/
